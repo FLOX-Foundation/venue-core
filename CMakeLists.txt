@@ -1,0 +1,69 @@
+cmake_minimum_required(VERSION 3.22)
+project(flox VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+include_directories(include)
+
+file(GLOB_RECURSE SRC_FILES
+    src/**/*.cpp
+)
+
+add_library(${PROJECT_NAME} STATIC ${SRC_FILES})
+
+target_compile_options(${PROJECT_NAME} PRIVATE
+  $<$<CONFIG:Release>:-O3 -march=native -flto -funroll-loops>
+)
+
+option(ENABLE_BENCHMARK "Enable benchmarks" ON)
+if (ENABLE_BENCHMARK)
+  add_subdirectory(benchmarks)
+endif()
+
+
+option(ENABLE_TESTS "Enable tests" ON)
+if (ENABLE_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()
+
+target_include_directories(flox PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+
+install(TARGETS flox
+  EXPORT floxTargets
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
+
+install(DIRECTORY include/ DESTINATION include)
+
+install(EXPORT floxTargets
+  FILE floxTargets.cmake
+  NAMESPACE flox::
+  DESTINATION lib/cmake/flox
+)
+
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+  "${CMAKE_CURRENT_BINARY_DIR}/floxConfigVersion.cmake"
+  VERSION ${PROJECT_VERSION}
+  COMPATIBILITY AnyNewerVersion
+)
+
+configure_package_config_file(
+  "${CMAKE_CURRENT_LIST_DIR}/cmake/floxConfig.cmake.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/floxConfig.cmake"
+  INSTALL_DESTINATION lib/cmake/flox
+)
+
+install(FILES
+  "${CMAKE_CURRENT_BINARY_DIR}/floxConfig.cmake"
+  "${CMAKE_CURRENT_BINARY_DIR}/floxConfigVersion.cmake"
+  DESTINATION lib/cmake/flox
+)

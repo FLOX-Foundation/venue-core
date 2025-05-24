@@ -1,0 +1,44 @@
+name: Build and Test
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y cmake g++-13 ninja-build
+
+    - name: Build and Install GoogleTest
+      run: |
+        git clone --depth=1 https://github.com/google/googletest.git
+        cmake -B gtest-build -S googletest
+        cmake --build gtest-build --target gtest gtest_main gmock gmock_main
+        sudo cmake --install gtest-build
+
+    - name: Build and Install Google Benchmark
+      run: |
+        git clone --depth=1 https://github.com/google/benchmark.git
+        cmake -B benchmark-build -S benchmark -DCMAKE_BUILD_TYPE=Release -DBENCHMARK_DOWNLOAD_DEPENDENCIES=ON
+        cmake --build benchmark-build -j$(nproc)
+        sudo cmake --install benchmark-build
+
+    - name: Configure project
+      run: |
+        cmake -B build \
+              -DCMAKE_CXX_COMPILER=g++-13 \
+              -DCMAKE_BUILD_TYPE=Debug \
+              -DENABLE_TESTS=ON \
+              -DENABLE_BENCHMARK=ON
+
+    - name: Build project
+      run: cmake --build build -j$(nproc)
+
+    - name: Run tests
+      run: ctest --test-dir build --output-on-failure
