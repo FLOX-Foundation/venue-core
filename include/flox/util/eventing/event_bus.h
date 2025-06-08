@@ -4,11 +4,10 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_map>
-#include <vector>
 
-#include "flox/engine/abstract_market_data_subscriber.h"
 #include "flox/engine/event_dispatcher.h"
 #include "flox/engine/tick_barrier.h"
 #include "flox/engine/tick_guard.h"
@@ -16,9 +15,6 @@
 
 namespace flox
 {
-
-template <typename Event, bool Sync, bool WithQueue = false>
-class EventBus;
 
 template <typename T>
 struct ListenerType
@@ -32,83 +28,95 @@ struct ListenerType<EventHandle<T>>
   using type = typename T::Listener;
 };
 
-template <typename Event, typename Bus>
-concept PushOnlyEventBus = requires(Bus b, std::shared_ptr<typename ListenerType<Event>::type> l, const Event& e) {
-  { b.subscribe(l) };
-  { b.publish(e) };
-  { b.start() };
-  { b.stop() };
+template <typename Event>
+struct SyncPolicy
+{
+  using QueueItem = std::pair<Event, TickBarrier*>;
+  static QueueItem makeItem(Event ev, TickBarrier* barrier) { return {ev, barrier}; }
+  static void dispatch(const QueueItem& item, typename ListenerType<Event>::type& listener)
+  {
+    TickGuard guard(*item.second);
+    EventDispatcher<Event>::dispatch(item.first, listener);
+  }
 };
 
-template <typename Event, typename Bus>
-concept QueueableEventBus = PushOnlyEventBus<Event, Bus> &&
-                            requires(Bus b, SubscriberId id) {
-                              { b.getQueue(id) } -> std::same_as<typename Bus::Queue*>;
-                            };
+template <typename Event>
+struct AsyncPolicy
+{
+  using QueueItem = Event;
+  static QueueItem makeItem(Event ev, void*) { return ev; }
+  static void dispatch(const QueueItem& item, typename ListenerType<Event>::type& listener)
+  {
+    EventDispatcher<Event>::dispatch(item, listener);
+  }
+};
 
-// Synchronous specialization
-template <typename Event, bool WithQueue>
-class EventBus<Event, true, WithQueue>
+template <typename Event, typename Policy>
+class EventBus
 {
  public:
   using Listener = typename ListenerType<Event>::type;
-  static constexpr size_t QueueSize = 4096;
-  using QueueItem = std::pair<Event, TickBarrier*>;
-  using Queue = SPSCQueue<QueueItem, QueueSize>;
+  using QueueItem = typename Policy::QueueItem;
+  using Queue = SPSCQueue<QueueItem, 4096>;
 
-  EventBus()
-  {
-    if constexpr (WithQueue)
-    {
-      static_assert(QueueableEventBus<Event, EventBus<Event, true, WithQueue>>,
-                    "EventBus does not conform to QueueableEventBus");
-    }
-    else
-    {
-      static_assert(PushOnlyEventBus<Event, EventBus<Event, true, WithQueue>>,
-                    "EventBus does not conform to PushOnlyEventBus");
-    }
-  };
-
+  EventBus() = default;
   ~EventBus() { stop(); }
 
   void subscribe(std::shared_ptr<Listener> listener)
   {
+    SubscriberMode mode = listener->mode();
+
     Entry e;
+    e.mode = mode;
     e.listener = std::move(listener);
     e.queue = std::make_unique<Queue>();
-    _subs.push_back(std::move(e));
+
+    std::lock_guard lock(_mutex);
+    _subs.emplace(e.listener->id(), std::move(e));
   }
 
   void start()
   {
     if (_running.exchange(true))
       return;
-    _active = _subs.size();
-    for (auto& entry : _subs)
+
+    std::lock_guard lock(_mutex);
+    _active = 0;
+
+    for (auto& [_, e] : _subs)
     {
-      auto& queue = *entry.queue;
-      auto& listener = entry.listener;
-      entry.thread = std::thread([this, &queue, &listener]
-                                 {
-        {
-          std::lock_guard<std::mutex> lk(_readyMutex);
-          if (--_active == 0)
-            _cv.notify_one();
-        }
-        while (_running.load(std::memory_order_acquire)) {
-          auto opt = queue.try_pop_ref();
-          if (opt) {
-            auto& [ev, barrier] = opt->get();
-            TickGuard guard(*barrier);
-            EventDispatcher<Event>::dispatch(ev, *listener);
-          } else {
-            std::this_thread::yield();
-          }
-        }
-        while (queue.try_pop_ref()) {} });
+      if (e.mode == SubscriberMode::PUSH)
+        ++_active;
     }
-    std::unique_lock<std::mutex> lk(_readyMutex);
+
+    for (auto& [_, e] : _subs)
+    {
+      if (e.mode == SubscriberMode::PUSH)
+      {
+        auto* queue = e.queue.get();
+        auto listener = e.listener;
+        e.thread.emplace([this, queue, listener]
+                         {
+          {
+            std::lock_guard<std::mutex> lk(_readyMutex);
+            if (--_active == 0) _cv.notify_one();
+          }
+          while (_running.load(std::memory_order_acquire)) {
+            if (auto* item = queue->try_pop()) {
+              Policy::dispatch(*item, *listener);
+              item->~QueueItem();
+            } else {
+              std::this_thread::yield();
+            }
+          }
+          while (auto* item = queue->try_pop()) {
+            Policy::dispatch(*item, *listener);
+            item->~QueueItem();
+          } });
+      }
+    }
+
+    std::unique_lock lk(_readyMutex);
     _cv.wait(lk, [&]
              { return _active == 0; });
   }
@@ -117,35 +125,64 @@ class EventBus<Event, true, WithQueue>
   {
     if (!_running.exchange(false))
       return;
-    for (auto& entry : _subs)
+    std::lock_guard lock(_mutex);
+    for (auto& [_, e] : _subs)
     {
-      if (entry.thread.joinable())
-        entry.thread.join();
-      while (entry.queue->try_pop_ref())
-      {
-      }
+      e.thread.reset();
+      e.queue->clear();
     }
     _subs.clear();
   }
 
-  void publish(const Event& event)
+  void publish(Event ev)
   {
-    TickBarrier barrier(_subs.size());
-    for (auto& entry : _subs)
+    if (!_running.load(std::memory_order_acquire))
+      return;
+
+    uint64_t seq = _tickCounter.fetch_add(1, std::memory_order_relaxed);
+
+    if constexpr (requires { ev->tickSequence; })
     {
-      entry.queue->push(QueueItem{event, &barrier});
+      ev->tickSequence = seq;
     }
-    barrier.wait();
+    if constexpr (requires { ev.tickSequence; })
+    {
+      ev.tickSequence = seq;
+    }
+
+    TickBarrier barrier(_subs.size());
+
+    std::lock_guard lock(_mutex);
+    for (auto& [_, e] : _subs)
+    {
+      if constexpr (std::is_same_v<Policy, SyncPolicy<Event>>)
+      {
+        e.queue->emplace(Policy::makeItem(ev, &barrier));
+      }
+      else
+      {
+        e.queue->emplace(Policy::makeItem(ev, nullptr));
+      }
+    }
+
+    if constexpr (std::is_same_v<Policy, SyncPolicy<Event>>)
+    {
+      barrier.wait();
+    }
   }
 
   Queue* getQueue(SubscriberId id)
   {
-    for (auto& entry : _subs)
-    {
-      if (entry.listener && entry.listener->id() == id)
-        return entry.queue.get();
-    }
+    std::lock_guard lock(_mutex);
+    auto it = _subs.find(id);
+    if (it != _subs.end() && it->second.mode == SubscriberMode::PULL)
+      return it->second.queue.get();
     return nullptr;
+  }
+
+  uint64_t currentTickId() const noexcept
+  {
+    return _tickCounter.load(std::memory_order_relaxed);
   }
 
  private:
@@ -153,139 +190,17 @@ class EventBus<Event, true, WithQueue>
   {
     std::shared_ptr<Listener> listener;
     std::unique_ptr<Queue> queue;
-    std::thread thread;
+    SubscriberMode mode = SubscriberMode::PUSH;
+    std::optional<std::jthread> thread;
   };
 
-  std::vector<Entry> _subs;
+  std::unordered_map<SubscriberId, Entry> _subs;
+  std::mutex _mutex;
   std::atomic<bool> _running{false};
   std::atomic<size_t> _active{0};
   std::condition_variable _cv;
   std::mutex _readyMutex;
-};
-
-// Asynchronous specialization
-template <typename Event>
-class EventBus<Event, false, false>
-{
- public:
-  using Listener = typename ListenerType<Event>::type;
-  static constexpr size_t QueueSize = 4096;
-  using QueueItem = Event;
-  using Queue = SPSCQueue<QueueItem, QueueSize>;
-
-  EventBus()
-  {
-    static_assert(PushOnlyEventBus<Event, EventBus<Event, false, false>>,
-                  "EventBus does not conform to PushOnlyEventBus");
-  };
-
-  ~EventBus() = default;
-
-  void subscribe(std::shared_ptr<Listener> listener)
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _listeners.push_back(std::move(listener));
-  }
-
-  void start() {}
-  void stop() {}
-
-  void publish(const Event& event)
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    for (auto& l : _listeners)
-    {
-      if (l)
-      {
-        EventDispatcher<Event>::dispatch(event, *l);
-      }
-    }
-  }
-
- private:
-  std::mutex _mutex;
-  std::vector<std::shared_ptr<Listener>> _listeners;
-};
-
-// Asynchronous specialization with per-subscriber queues (PULL/PUSH)
-template <typename Event>
-class EventBus<Event, false, true>
-{
- public:
-  using Listener = typename ListenerType<Event>::type;
-  static constexpr size_t QueueSize = 4096;
-  using QueueItem = Event;
-  using Queue = SPSCQueue<QueueItem, QueueSize>;
-
-  EventBus()
-  {
-    static_assert(QueueableEventBus<Event, EventBus<Event, false, true>>,
-                  "EventBus does not conform to QueueableEventBus");
-  }
-
-  struct SubscriberEntry
-  {
-    SubscriberMode mode;
-    std::shared_ptr<Listener> subscriber;
-    std::unique_ptr<Queue> queue;
-  };
-
-  void subscribe(std::shared_ptr<Listener> sub)
-  {
-    SubscriberEntry e;
-    e.mode = sub->mode();
-    e.subscriber = std::move(sub);
-    if (e.mode == SubscriberMode::PULL)
-      e.queue = std::make_unique<Queue>();
-
-    std::lock_guard<std::mutex> lock(_mutex);
-    _subs.emplace(e.subscriber->id(), std::move(e));
-  }
-
-  Queue* getQueue(SubscriberId id)
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    auto it = _subs.find(id);
-    if (it != _subs.end() && it->second.mode == SubscriberMode::PULL)
-      return it->second.queue.get();
-    return nullptr;
-  }
-
-  void start() {}
-  void stop()
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    for (auto& [_, sub] : _subs)
-    {
-      if (sub.queue)
-      {
-        while (sub.queue->try_pop_ref())
-        {
-        }
-      }
-    }
-    _subs.clear();
-  }
-
-  void publish(const Event& event)
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    for (auto& [_, sub] : _subs)
-    {
-      if (sub.mode == SubscriberMode::PUSH && sub.subscriber)
-      {
-        EventDispatcher<Event>::dispatch(event, *sub.subscriber);
-      }
-      else if (sub.mode == SubscriberMode::PULL && sub.queue)
-      {
-        sub.queue->push(event);
-      }
-    }
-  }
-
- private:
-  std::mutex _mutex;
-  std::unordered_map<SubscriberId, SubscriberEntry> _subs;
+  std::atomic<uint64_t> _tickCounter{0};
 };
 
 }  // namespace flox

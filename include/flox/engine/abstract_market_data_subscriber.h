@@ -9,30 +9,24 @@
 
 #pragma once
 
-#include "flox/book/events/book_update_event.h"
-#include "flox/book/events/trade_event.h"
+#include "flox/engine/abstract_subscriber.h"
 #include "flox/engine/events/market_data_event.h"
 
 namespace flox
 {
 
-using SubscriberId = uint64_t;
-enum class SubscriberMode
-{
-  PUSH,
-  PULL
-};
+class BookUpdateEvent;
+class TradeEvent;
+class CandleEvent;
 
-class IMarketDataSubscriber
+class IMarketDataSubscriber : public ISubscriber
 {
  public:
   virtual ~IMarketDataSubscriber() = default;
 
   virtual void onBookUpdate(const BookUpdateEvent& ev) {}
   virtual void onTrade(const TradeEvent& ev) {}
-
-  virtual SubscriberId id() const = 0;
-  virtual SubscriberMode mode() const { return SubscriberMode::PUSH; }
+  virtual void onCandle(const CandleEvent& ev) {}
 };
 
 }  // namespace flox
