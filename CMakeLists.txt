@@ -5,13 +5,13 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-option(ENABLE_DEV_SETUP "Install pre-commit hook" ON)
+option(ENABLE_DEV_SETUP "Install pre-commit hook" OFF)
 
 if(ENABLE_DEV_SETUP)
   message(STATUS "Developer setup enabled")
 
-  set(PRECOMMIT_SRC "${CMAKE_SOURCE_DIR}/scripts/pre-commit")
-  set(PRECOMMIT_DST "${CMAKE_SOURCE_DIR}/.git/hooks/pre-commit")
+  set(PRECOMMIT_SRC "${CMAKE_CURRENT_SOURCE_DIR}/scripts/pre-commit")
+  set(PRECOMMIT_DST "${CMAKE_CURRENT_SOURCE_DIR}/.git/hooks/pre-commit")
 
   if(EXISTS "${PRECOMMIT_SRC}")
     execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -40,7 +40,7 @@ target_compile_options(${FLOX} PUBLIC
 
 add_library(${FLOX_SYNC} STATIC ${SRC_FILES})
 add_library(flox::${FLOX_SYNC} ALIAS ${FLOX_SYNC})
-target_compile_definitions(${FLOX_SYNC} PUBLIC USE_SYNC_MARKET_BUS USE_SYNC_ORDER_BUS USE_SYNC_CANDLE_BUS)
+target_compile_definitions(${FLOX_SYNC} PUBLIC USE_SYNC_BOOK_UPDATE_BUS USE_SYNC_TRADE_BUS USE_SYNC_ORDER_BUS USE_SYNC_CANDLE_BUS)
 target_compile_options(${FLOX_SYNC} PUBLIC
   $<$<CONFIG:Release>:-O3 -march=native -flto -funroll-loops>
 )
