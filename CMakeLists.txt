@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(flox VERSION 0.1.0 LANGUAGES CXX)
+project(flox VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -40,7 +40,7 @@ target_compile_options(${FLOX} PUBLIC
 
 add_library(${FLOX_SYNC} STATIC ${SRC_FILES})
 add_library(flox::${FLOX_SYNC} ALIAS ${FLOX_SYNC})
-target_compile_definitions(${FLOX_SYNC} PUBLIC USE_SYNC_BOOK_UPDATE_BUS USE_SYNC_TRADE_BUS USE_SYNC_ORDER_BUS USE_SYNC_CANDLE_BUS)
+target_compile_definitions(${FLOX_SYNC} PUBLIC FLOX_USE_SYNC_BOOK_UPDATE_BUS FLOX_USE_SYNC_TRADE_BUS FLOX_USE_SYNC_ORDER_BUS FLOX_USE_SYNC_CANDLE_BUS)
 target_compile_options(${FLOX_SYNC} PUBLIC
   $<$<CONFIG:Release>:-O3 -march=native -flto -funroll-loops>
 )
